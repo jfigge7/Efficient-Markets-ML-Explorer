@@ -1,2 +1,4 @@
 .env
 CMD-commands.bat
+__pycache__
+.vscode
