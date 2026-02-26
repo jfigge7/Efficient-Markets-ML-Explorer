@@ -50,9 +50,6 @@ OUTPUT_FILE_PREFIX_DEFAULT = os.getenv("OBS_OUTPUT_PREFIX", "observations")
 
 SORT_BEFORE_WRITE_DEFAULT = bool(os.getenv("SORT_BEFORE_WRITE", "False"))
 
-MIN_SUBMISSION_COMMENTS = int(os.getenv("MIN_SUBMISSION_COMMENTS", "5"))
-MIN_SUBMISSION_SCORE = int(os.getenv("MIN_SUBMISSION_SCORE", "10"))
-
 # If a token is ambiguous (common English word / preposition / etc), we require
 # that it appears as ALL CAPS (e.g., "ON" not "on") OR as a cashtag ($ON).
 AMBIGUOUS_TICKERS: Set[str] = {
@@ -291,57 +288,6 @@ def _scores_to_fixed_schema(
             out[lab] = sc
     return out
 
-def _iter_comments_by_submission(
-    comments: List[Dict[str, Any]],
-    *,
-    assume_grouped: bool = False,
-    sort_if_needed: bool = True,
-):
-    """
-    Yield (submission_id, [comments_for_submission]) pairs.
-
-    - If assume_grouped=True, we treat the input as already grouped by link_id
-      and stream with O(max_comments_in_one_submission) memory.
-    - If assume_grouped=False and sort_if_needed=True, we sort by submission_id
-      first (requires holding list refs, O(N log N)).
-    """
-    if not comments:
-        return
-        yield  # make generator
-
-    def _sub_id(c: Dict[str, Any]) -> str:
-        return _base_id(c.get("link_id"))
-
-    if not assume_grouped:
-        if not sort_if_needed:
-            raise ValueError(
-                "comments are not assumed grouped; set sort_if_needed=True "
-                "or provide comments grouped by link_id."
-            )
-        # Sorting creates a new list of references; you still avoid the huge global agg
-        comments = sorted(comments, key=_sub_id)
-
-    cur_sid = None
-    buf: List[Dict[str, Any]] = []
-
-    for c in comments:
-        sid = _sub_id(c)
-        if not sid:
-            continue
-
-        if cur_sid is None:
-            cur_sid = sid
-
-        if sid != cur_sid:
-            yield cur_sid, buf
-            buf = []
-            cur_sid = sid
-
-        buf.append(c)
-
-    if cur_sid is not None and buf:
-        yield cur_sid, buf
-
 
 # ----------------------------
 # Stocks parquet -> regexes + company->ticker mapping
@@ -556,43 +502,42 @@ def _submission_features(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 # ----------------------------
 # Pseudo comment rows for title/selftext
 # ----------------------------
-def _make_submission_pseudo_rows_one(sub: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not sub:
-        return []
-    sid_base = _base_id(sub.get("id"))
-    if not sid_base:
-        return []
-
-    author = sub.get("author") if sub.get("author") is not None else "[deleted]"
-    title = _clean_text(sub.get("title") or "")
-    selftext = _clean_text(sub.get("selftext") or "")
-
+def _make_submission_pseudo_rows(submissions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     pseudo: List[Dict[str, Any]] = []
-    if title:
-        pseudo.append(
-            {
-                "submission_id": sid_base,
-                "ticker_text": title,
-                "author": author,
-                "comment_score": 0.0,
-                "depth": 0,
-                "weight": 1.0 * TITLE_WEIGHT_MULT,
-                "kind": "submission_title",
-            }
-        )
+    for s in submissions or []:
+        sid_base = _base_id(s.get("id"))
+        if not sid_base:
+            continue
 
-    if selftext:
-        pseudo.append(
-            {
-                "submission_id": sid_base,
-                "ticker_text": selftext,
-                "author": author,
-                "comment_score": 0.0,
-                "depth": 0,
-                "weight": 1.0 * SELFTEXT_WEIGHT_MULT,
-                "kind": "submission_selftext",
-            }
-        )
+        author = s.get("author") if s.get("author") is not None else "[deleted]"
+        title = _clean_text(s.get("title") or "")
+        selftext = _clean_text(s.get("selftext") or "")
+
+        if title:
+            pseudo.append(
+                {
+                    "submission_id": sid_base,
+                    "ticker_text": title,
+                    "author": author,
+                    "comment_score": 0.0,
+                    "depth": 0,
+                    "weight": 1.0 * TITLE_WEIGHT_MULT,
+                    "kind": "submission_title",
+                }
+            )
+
+        if selftext:
+            pseudo.append(
+                {
+                    "submission_id": sid_base,
+                    "ticker_text": selftext,
+                    "author": author,
+                    "comment_score": 0.0,
+                    "depth": 0,
+                    "weight": 1.0 * SELFTEXT_WEIGHT_MULT,
+                    "kind": "submission_selftext",
+                }
+            )
 
     return pseudo
 
@@ -800,59 +745,84 @@ def _iter_agg_rows(
         yield row
 
 
-def _append_rows_to_batched_files(
-    *,
-    rows_iterable,
+def _write_agg_to_batched_files(
+    agg: Dict[Tuple[str, str], Dict[str, Any]],
+    sub_feats_cache: Dict[str, Dict[str, Any]],
     out_dir: Union[str, Path],
-    rows_per_file: int,
-    fmt: str,
-    prefix: str,
-    sort_before_write: bool,
-    batch_rows: List[Dict[str, Any]],
-    batch_idx: int,
-    paths: List[Path],
-) -> int:
+    rows_per_file: int = OUTPUT_ROWS_PER_FILE_DEFAULT,
+    fmt: str = OUTPUT_FORMAT_DEFAULT,
+    prefix: str = OUTPUT_FILE_PREFIX_DEFAULT,
+    sort_before_write: bool = SORT_BEFORE_WRITE_DEFAULT,
+) -> List[Path]:
     """
-    Append rows into the existing batch_rows buffer; flush to disk as needed.
-    Returns updated batch_idx.
+    Convert agg -> rows and write to disk in smaller dataframe batches.
+
+    If sort_before_write=True, we sort keys first for deterministic order, but that
+    requires materializing the sorted key list (still much smaller than a giant DF).
     """
+    paths: List[Path] = []
+    batch_rows: List[Dict[str, Any]] = []
+    batch_idx = 0
+
     if sort_before_write:
-        # rows_iterable is expected to be a list or generator; easiest is to materialize
-        # per-submission (small) and sort in-memory.
-        rows_list = list(rows_iterable)
-        rows_list.sort(key=lambda r: (r.get("submission_id", ""), r.get("ticker", "")))
-        rows_iterable = rows_list
+        items_iter = (
+            ((sid, tkr), agg[(sid, tkr)])
+            for (sid, tkr) in sorted(agg.keys(), key=lambda x: (x[0], x[1]))
+        )
+
+        def row_iter():
+            for (submission_id, ticker), a in items_iter:
+                # inline copy of _iter_agg_rows logic to avoid extra dict iteration
+                n = int(a["n_items"])
+                weight_sum = float(a["weight_sum"])
+                denom = weight_sum if weight_sum != 0.0 else float("nan")
+
+                row = {
+                    "submission_id": submission_id,
+                    "ticker": ticker,
+                    **sub_feats_cache.get(submission_id, {}),
+                    "n_items": n,
+                    "n_authors": int(len(a["authors"])),
+                    "comment_score_sum": float(a["comment_score_sum"]),
+                    "comment_score_mean": float(a["comment_score_sum"]) / n if n else float("nan"),
+                    "comment_score_max": float(a["comment_score_max"]) if n else float("nan"),
+                    "avg_depth": float(a["depth_sum"]) / n if n else float("nan"),
+                    "n_from_comments": int(a["n_from_comments"]),
+                    "n_from_title": int(a["n_from_title"]),
+                    "n_from_selftext": int(a["n_from_selftext"]),
+                    "fin_neg_sum_w": float(a["fin_neg_wsum"]),
+                    "fin_neu_sum_w": float(a["fin_neu_wsum"]),
+                    "fin_pos_sum_w": float(a["fin_pos_wsum"]),
+                    "tw_neg_sum_w": float(a["tw_neg_wsum"]),
+                    "tw_neu_sum_w": float(a["tw_neu_wsum"]),
+                    "tw_pos_sum_w": float(a["tw_pos_wsum"]),
+                    "fin_neg_mean_w": float(a["fin_neg_wsum"]) / denom if weight_sum else float("nan"),
+                    "fin_neu_mean_w": float(a["fin_neu_wsum"]) / denom if weight_sum else float("nan"),
+                    "fin_pos_mean_w": float(a["fin_pos_wsum"]) / denom if weight_sum else float("nan"),
+                    "tw_neg_mean_w": float(a["tw_neg_wsum"]) / denom if weight_sum else float("nan"),
+                    "tw_neu_mean_w": float(a["tw_neu_wsum"]) / denom if weight_sum else float("nan"),
+                    "tw_pos_mean_w": float(a["tw_pos_wsum"]) / denom if weight_sum else float("nan"),
+                }
+                yield row
+
+        rows_iterable = row_iter()
+    else:
+        rows_iterable = _iter_agg_rows(agg, sub_feats_cache)
 
     for row in rows_iterable:
         batch_rows.append(row)
         if len(batch_rows) >= int(rows_per_file):
-            path = _write_batch_rows(
-                batch_rows,
-                out_dir=out_dir,
-                batch_idx=batch_idx,
-                fmt=fmt,
-                prefix=prefix,
-            )
+            path = _write_batch_rows(batch_rows, out_dir=out_dir, batch_idx=batch_idx, fmt=fmt, prefix=prefix)
             paths.append(path)
             batch_rows.clear()
             batch_idx += 1
 
-    return batch_idx
+    if batch_rows:
+        path = _write_batch_rows(batch_rows, out_dir=out_dir, batch_idx=batch_idx, fmt=fmt, prefix=prefix)
+        paths.append(path)
+        batch_rows.clear()
 
-def _submission_passes_min_activity(sub: Optional[Dict[str, Any]]) -> bool:
-    if not sub:
-        return False  # skip if submission metadata missing
-
-    n_comments = sub.get("num_comments")
-    score = sub.get("score")
-
-    n_comments_i = int(n_comments) if n_comments is not None else 0
-    score_i = int(score) if score is not None else 0
-
-    return (
-        n_comments_i >= MIN_SUBMISSION_COMMENTS
-        and score_i >= MIN_SUBMISSION_SCORE
-    )
+    return paths
 
 
 # ----------------------------
@@ -867,21 +837,19 @@ def build_observations_batched(
     file_format: str = OUTPUT_FORMAT_DEFAULT,  # parquet|csv
     file_prefix: str = OUTPUT_FILE_PREFIX_DEFAULT,
     sort_before_write: bool = SORT_BEFORE_WRITE_DEFAULT,
-    assume_comments_grouped_by_submission: bool = False,
-    sort_comments_by_submission_if_needed: bool = True,
 ) -> List[Path]:
     """
-    Per-submission aggregation (Option B):
-      - aggregate only within one submission at a time
-      - finalize rows for that submission
-      - append to output batches and flush to disk
+    Like build_observations_df(), but instead of returning one giant dataframe,
+    it writes smaller dataframe batches to out_dir and returns the written paths.
 
-    This removes the global agg, bounding memory roughly by:
-      max(comments_in_one_submission) + max(keys_in_one_submission) + output_batch_size
+    This addresses the "ballooning dataframe" part by never materializing the full DF.
+
+    Note: the aggregation dict (agg) can still grow large if you have an enormous number
+    of (submission_id, ticker) pairs. If that becomes the bottleneck, the next step is
+    spilling/merging aggregation itself.
     """
-
     if not isinstance(comments, list):
-        raise ValueError("comments must be a list of dicts")
+        raise ValueError("comments must be a list of dicts (depth computation needs full pass)")
 
     submissions = submissions or []
 
@@ -890,113 +858,86 @@ def build_observations_batched(
     pipe_tw = _get_twitter_roberta()
 
     sub_idx = _index_submissions(submissions)
+    depths_by_base = compute_depths(comments)
 
-    paths: List[Path] = []
-    batch_rows: List[Dict[str, Any]] = []
-    batch_idx = 0
+    agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    total_late_dropped = 0
+    # -------------------------
+    # Stream comments in chunks
+    # -------------------------
+    late_dropped = 0
+    chunk_items: List[Dict[str, Any]] = []
 
-    # Iterate submission-by-submission
-    for submission_id, sub_comments in _iter_comments_by_submission(
-        comments,
-        assume_grouped=assume_comments_grouped_by_submission,
-        sort_if_needed=sort_comments_by_submission_if_needed,
-    ):
+    for c in comments:
+        submission_id = _base_id(c.get("link_id"))  # link_id is t3_xxx
         sub = sub_idx.get(submission_id) or sub_idx.get(f"t3_{submission_id}")
 
-        # Filter by overall submission activity (from metadata)
-        if not _submission_passes_min_activity(sub):
+        if _is_comment_too_late(c, sub):
+            late_dropped += 1
             continue
 
-        # Compute depths only for this submission's comments
-        depths_by_base = compute_depths(sub_comments)
-
-        # Per-submission aggregation dict
-        agg_sub: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
-        # Chunk + process comment items for this submission
-        chunk_items: List[Dict[str, Any]] = []
-        late_dropped = 0
-
-        for c in sub_comments:
-            if _is_comment_too_late(c, sub):
-                late_dropped += 1
-                continue
-
-            body = _clean_text(c.get("body") or "")
-            if not body:
-                continue
-
-            cid_base = _base_id(c.get("id"))
-            depth = depths_by_base.get(cid_base, 0)
-            w = decay_weight(depth)
-
-            chunk_items.append(
-                {
-                    "submission_id": submission_id,
-                    "ticker_text": body,
-                    "author": c.get("author") if c.get("author") is not None else "[deleted]",
-                    "comment_score": float(c.get("score")) if c.get("score") is not None else 0.0,
-                    "depth": depth,
-                    "weight": w,
-                    "kind": "comment",
-                }
-            )
-
-            if len(chunk_items) >= CHUNK_SIZE_ITEMS:
-                _process_items_chunk(pipe_fin, pipe_tw, agg_sub, chunk_items)
-                chunk_items = []
-
-        if chunk_items:
-            _process_items_chunk(pipe_fin, pipe_tw, agg_sub, chunk_items)
-
-        total_late_dropped += late_dropped
-
-        # Process this submission's pseudo-items (title/selftext)
-        pseudo_items = _make_submission_pseudo_rows_one(sub)
-        for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
-            _process_items_chunk(pipe_fin, pipe_tw, agg_sub, pseudo_chunk)
-
-        if not agg_sub:
-            # Nothing to write for this submission
+        body = _clean_text(c.get("body") or "")
+        if not body:
             continue
 
-        # Build features for this submission only
-        sub_feats_cache = {submission_id: _submission_features(sub)}
+        cid_base = _base_id(c.get("id"))
+        depth = depths_by_base.get(cid_base, 0)
+        w = decay_weight(depth)
 
-        # Finalize rows and append to output batches
-        rows_iterable = _iter_agg_rows(agg_sub, sub_feats_cache)
-        batch_idx = _append_rows_to_batched_files(
-            rows_iterable=rows_iterable,
-            out_dir=out_dir,
-            rows_per_file=rows_per_file,
-            fmt=file_format,
-            prefix=file_prefix,
-            sort_before_write=sort_before_write,
-            batch_rows=batch_rows,
-            batch_idx=batch_idx,
-            paths=paths,
+        chunk_items.append(
+            {
+                "submission_id": submission_id,
+                "ticker_text": body,
+                "author": c.get("author") if c.get("author") is not None else "[deleted]",
+                "comment_score": float(c.get("score")) if c.get("score") is not None else 0.0,
+                "depth": depth,
+                "weight": w,
+                "kind": "comment",
+            }
         )
 
-        # agg_sub falls out of scope here -> memory released
+        if len(chunk_items) >= CHUNK_SIZE_ITEMS:
+            _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
+            chunk_items = []
 
-    # Flush tail batch rows
-    if batch_rows:
-        path = _write_batch_rows(
-            batch_rows,
-            out_dir=out_dir,
-            batch_idx=batch_idx,
-            fmt=file_format,
-            prefix=file_prefix,
-        )
-        paths.append(path)
-        batch_rows.clear()
+    if chunk_items:
+        _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
 
-    if total_late_dropped:
-        print(f"Dropped {total_late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
+    if late_dropped:
+        print(f"Dropped {late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
 
-    return paths
+    # -------------------------
+    # Process pseudo-items (titles/selftext) in chunks too
+    # -------------------------
+    pseudo_items = _make_submission_pseudo_rows(submissions)
+    for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
+        _process_items_chunk(pipe_fin, pipe_tw, agg, pseudo_chunk)
+
+    if not agg:
+        return []
+
+    # -------------------------
+    # Submission features cache
+    # -------------------------
+    sub_feats_cache: Dict[str, Dict[str, Any]] = {}
+    sids = sorted({sid for (sid, _tkr) in agg.keys()})
+    for sid in sids:
+        sub = sub_idx.get(sid) or sub_idx.get(f"t3_{sid}")
+        sub_feats_cache[sid] = _submission_features(sub)
+
+    # -------------------------
+    # Write batches + return paths
+    # -------------------------
+    written_paths = _write_agg_to_batched_files(
+        agg=agg,
+        sub_feats_cache=sub_feats_cache,
+        out_dir=out_dir,
+        rows_per_file=rows_per_file,
+        fmt=file_format,
+        prefix=file_prefix,
+        sort_before_write=sort_before_write,
+    )
+    return written_paths
 
 
 # ----------------------------
