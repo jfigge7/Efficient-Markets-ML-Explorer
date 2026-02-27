@@ -485,6 +485,42 @@ def _base_id_sql(col: str) -> str:
     END
     """
 
+# ----------------------------
+# DuckDB streaming (Arrow) + column-pruned conversion (FASTER)
+# ----------------------------
+
+# Minimal set of comment columns your pipeline uses.
+# (submission_id is computed in SQL)
+_COMMENT_COLS_NEEDED = [
+    "id",
+    "parent_id",
+    "link_id",
+    "author",
+    "body",
+    "score",
+    "created_utc",
+    "created_ts",
+]
+
+def _parquet_columns_duckdb(con: duckdb.DuckDBPyConnection, parquet_glob: str) -> Set[str]:
+    """
+    Get column names for the parquet glob with minimal IO.
+    DuckDB reads metadata/footers for LIMIT 0, not the full dataset.
+    """
+    t = con.execute(f"SELECT * FROM read_parquet('{parquet_glob}') LIMIT 0").fetch_arrow_table()
+    return set(t.schema.names)
+
+def _rows_from_recordbatch_pruned(rb: pa.RecordBatch, cols: List[str]) -> Iterator[Dict[str, Any]]:
+    """
+    Convert only selected columns in this RecordBatch into row dicts.
+    Fast path: convert each needed column to a python list once, then zip by index.
+    """
+    # Note: rb.column(i).to_pylist() is typically faster than per-row scalar.as_py()
+    data = {c: rb.column(rb.schema.get_field_index(c)).to_pylist() for c in cols}
+    n = rb.num_rows
+    for i in range(n):
+        yield {c: data[c][i] for c in cols}
+
 def iter_comments_grouped_duckdb(
     con: duckdb.DuckDBPyConnection,
     comments_glob: str,
@@ -492,9 +528,10 @@ def iter_comments_grouped_duckdb(
     batch_rows: int = 50_000,
 ) -> Iterator[Tuple[str, List[Dict[str, Any]]]]:
     """
-    True streaming (no OFFSET) for duckdb==1.4.4:
-      - uses a cursor
-      - streams Arrow record batches via RecordBatchReader
+    True streaming (no OFFSET) with lower overhead:
+      - cursor -> fetch_record_batch
+      - SQL selects ONLY required columns (+ computed submission_id)
+      - per Arrow RecordBatch: convert only needed columns to Python lists once
       - yields grouped (submission_id, [comment_dicts]) without loading all comments
 
     Assumes:
@@ -502,12 +539,30 @@ def iter_comments_grouped_duckdb(
       - submission_id = base_id(link_id) (computed in SQL)
       - ORDER BY submission_id ensures grouping correctness across batches
     """
+    # Figure out which optional timestamp columns exist (created_utc / created_ts)
+    available = _parquet_columns_duckdb(con, comments_glob)
+
+    # Hard requirements for your downstream logic
+    required = {"id", "parent_id", "link_id", "author", "body", "score"}
+    missing_req = [c for c in required if c not in available]
+    if missing_req:
+        raise ValueError(
+            f"Comments parquet is missing required columns: {missing_req}. "
+            f"Available columns include: {sorted(list(available))[:50]} ..."
+        )
+
+    # Only keep columns that actually exist (robust to created_ts/created_utc differences)
+    cols = [c for c in _COMMENT_COLS_NEEDED if c in available]
+
     sub_expr = _base_id_sql("link_id")
+
+    # Column-pruned query (this is the main win vs SELECT *)
+    select_cols_sql = ",\n        ".join(cols)
 
     q = f"""
       SELECT
         {sub_expr} AS submission_id,
-        *
+        {select_cols_sql}
       FROM read_parquet('{comments_glob}')
       WHERE link_id IS NOT NULL
       ORDER BY submission_id
@@ -516,17 +571,17 @@ def iter_comments_grouped_duckdb(
     cur = con.cursor()
     cur.execute(q)
 
-    # In duckdb 1.4.4, this returns a pyarrow.RecordBatchReader
     reader = cur.fetch_record_batch(int(batch_rows))
 
     cur_sid: Optional[str] = None
     buf: List[Dict[str, Any]] = []
 
-    for rb in reader:  # rb is a pyarrow.RecordBatch
-        # Convert this batch to row dicts (bounded by batch_rows)
-        rows = pa.Table.from_batches([rb]).to_pylist()
+    # We will convert only these columns from each RecordBatch
+    pruned_cols = ["submission_id"] + cols
 
-        for r in rows:
+    for rb in reader:  # rb is a pyarrow.RecordBatch
+        # rb already contains only the selected columns, but we still avoid .to_pylist() on full rows.
+        for r in _rows_from_recordbatch_pruned(rb, pruned_cols):
             sid = r.get("submission_id")
             if not sid:
                 continue
@@ -535,17 +590,18 @@ def iter_comments_grouped_duckdb(
                 cur_sid = sid
 
             if sid != cur_sid:
-                # emit previous submission group
                 yield cur_sid, buf
                 buf = []
                 cur_sid = sid
 
+            # Drop submission_id from each comment dict (your downstream uses submission_id from the group key)
+            # If you prefer keeping it in each dict, remove the pop().
+            r.pop("submission_id", None)
+
             buf.append(r)
 
-    # flush tail
     if cur_sid is not None and buf:
         yield cur_sid, buf
-
 
 def load_submissions_index_duckdb(con, submissions_glob: str) -> Dict[str, Dict[str, Any]]:
     q = f"SELECT * FROM read_parquet('{submissions_glob}')"
