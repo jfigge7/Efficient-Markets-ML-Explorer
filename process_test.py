@@ -1,38 +1,33 @@
-from preprocessing import build_observations_batched as new
-from preprocessing_gpu import build_observations_batched as gpu
+from preprocessing_gpu_streaming import (
+    build_observations_batched_stream,
+    iter_comments_grouped_duckdb,
+)
+
 import os
 from dotenv import load_dotenv
 load_dotenv()
+
 import duckdb
 from pathlib import Path
-from typing import List, Dict, Any
-import pandas as pd
+
 con = duckdb.connect()
+con.execute("PRAGMA threads=8")
 
 COMMENTS = str(Path(os.getenv("DATA_DIR")) / "comment_db" / "year=2020" / "month=4" / "day=15" / "*.parquet")
 SUBMISSIONS = str(Path(os.getenv("DATA_DIR")) / "submission_db" / "year=2020" / "month=4" / "day=15" / "*.parquet")
-comments_df = con.execute(
-    f"SELECT * FROM read_parquet('{COMMENTS}')"
-).df()
 
-submissions_df = con.execute(
-    f"SELECT * FROM read_parquet('{SUBMISSIONS}')"
-).df()
+# submissions can still be loaded into memory (usually much smaller than comments)
+submissions = con.execute(f"SELECT * FROM read_parquet('{SUBMISSIONS}')").df().to_dict("records")
 
-comments: List[Dict[str, Any]] = comments_df.to_dict(orient="records")
-submissions: List[Dict[str, Any]] = submissions_df.to_dict(orient="records")
+# THIS is the streaming piece: an iterator of (submission_id, [comments...])
+comment_groups = iter_comments_grouped_duckdb(con, COMMENTS, batch_rows=50_000)
 
-#df1 = new(comments, submissions)
-#dfs1 = [pd.read_parquet(p) for p in df1]
-#obs1 = pd.concat(dfs1, ignore_index=True).sort_values(by=["submission_id", "ticker"]).reset_index(drop=True)
-#print(obs1)
-df2 = gpu(comments, submissions)
-#dfs2 = [pd.read_parquet(p) for p in df2]
-#obs2 = pd.concat(dfs2, ignore_index=True).sort_values(by=["submission_id", "ticker"]).reset_index(drop=True)
-#merged_df = pd.merge(obs1, obs2, on=['submission_id', 'ticker'], how='outer', indicator=True)
+paths = build_observations_batched_stream(
+    comment_groups,
+    submissions=submissions,
+    rows_per_file=50_000,   # strongly recommended at scale
+    file_format="parquet",
+    file_prefix="observations",
+)
 
-# Filter for rows that are not in both DataFrames
-#differences = merged_df[merged_df['_merge'] != 'both']
-#print(differences)
-#print(len(obs1), len(obs2), len(differences))
-#print(obs1.items())
+print("Wrote:", len(paths), "files")
