@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 from transformers import pipeline
+import torch
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -45,13 +46,18 @@ COMMENT_CUTOFF_HOURS = float(os.getenv("COMMENT_CUTOFF_HOURS", "24"))
 # Output batching (new)
 OUTPUT_DIR_DEFAULT = os.getenv("OBS_OUTPUT_DIR")
 OUTPUT_FORMAT_DEFAULT = os.getenv("OBS_OUTPUT_FORMAT", "parquet").lower()  # parquet|csv
-OUTPUT_ROWS_PER_FILE_DEFAULT = int(os.getenv("OBS_OUTPUT_ROWS_PER_FILE", "50"))
+OUTPUT_ROWS_PER_FILE_DEFAULT = int(os.getenv("OBS_OUTPUT_ROWS_PER_FILE", "100"))
 OUTPUT_FILE_PREFIX_DEFAULT = os.getenv("OBS_OUTPUT_PREFIX", "observations")
 
 SORT_BEFORE_WRITE_DEFAULT = bool(os.getenv("SORT_BEFORE_WRITE", "False"))
 
 MIN_SUBMISSION_COMMENTS = int(os.getenv("MIN_SUBMISSION_COMMENTS", "5"))
 MIN_SUBMISSION_SCORE = int(os.getenv("MIN_SUBMISSION_SCORE", "10"))
+
+if torch.cuda.is_available():
+    DEVICE = 0
+else:
+    DEVICE = -1
 
 # If a token is ambiguous (common English word / preposition / etc), we require
 # that it appears as ALL CAPS (e.g., "ON" not "on") OR as a cashtag ($ON).
@@ -207,7 +213,7 @@ def _write_batch_rows(
     df = pd.DataFrame.from_records(rows)
 
     if fmt == "parquet":
-        path = out_dir_p / f"{prefix}_{batch_idx:06d}.parquet"
+        path = out_dir_p / f"{prefix}_{batch_idx:07d}.parquet"
         try:
             df.to_parquet(path, index=False)
             return path
@@ -242,7 +248,7 @@ def _pipeline_text_cls(model_ref: str, batch_size: int):
         "text-classification",
         model=model_ref,
         tokenizer=model_ref,
-        device=-1,  # -1 = CUDA GPU, 0 = CPU  (note: your comment was reversed; leaving as-is)
+        device= DEVICE,  # -1 = CPU, 0 = CUDA GPU  (note: your comment was reversed; leaving as-is)
         batch_size=batch_size,
         local_files_only=local_only,  # only enforce local if it's actually local
     )
@@ -265,7 +271,8 @@ def _get_twitter_roberta():
 
 
 def _run_pipe_all_scores(pipe, texts: List[str]) -> List[List[Dict[str, Any]]]:
-    out = pipe(texts, top_k=None, truncation=True)
+    max_len = getattr(pipe.model.config, "max_position_embeddings", 514) - 2
+    out = pipe(texts, top_k=None, truncation=True, max_length=max_len, padding=True)
     if isinstance(out, list) and out and isinstance(out[0], dict):
         return [out]
     return out
@@ -707,30 +714,40 @@ def _process_items_chunk(
     """
     items: list of dicts with keys:
       submission_id, ticker_text, author, comment_score, depth, weight, kind
-    Runs both models on the chunk, extracts tickers, updates agg immediately.
+
+    New behavior: extract tickers first (fast regex), then only run models on texts that contain tickers.
     """
     if not items:
         return
 
-    texts = [it["ticker_text"] for it in items]
-
-    try:
-        fin_preds = _run_pipe_all_scores(pipe_fin, texts)
-    except Exception as e:
-        print(f"Warning: finbert error on chunk (n={len(texts)}): {e}")
-        fin_preds = [None] * len(texts)
-
-    try:
-        tw_preds = _run_pipe_all_scores(pipe_tw, texts)
-    except Exception as e:
-        print(f"Warning: twitter error on chunk (n={len(texts)}): {e}")
-        tw_preds = [None] * len(texts)
-
-    for it, fin_p, tw_p in zip(items, fin_preds, tw_preds):
+    # First pass: extract tickers cheaply
+    items_with_tickers: List[Tuple[Dict[str, Any], List[str]]] = []
+    for it in items:
         tickers = extract_tickers_from_text(it["ticker_text"])
-        if not tickers:
-            continue
+        if tickers:
+            items_with_tickers.append((it, tickers))
 
+    # Nothing to do if no texts contain tickers
+    if not items_with_tickers:
+        return
+
+    texts = [it["ticker_text"] for it, _ in items_with_tickers]
+
+    # Run FinBERT
+    fin_preds = _run_pipe_all_scores(pipe_fin, texts)
+
+    # Run Twitter RoBERTa
+    tw_preds = _run_pipe_all_scores(pipe_tw, texts)
+
+    # Sanity-length checks: both preds lists should match texts length (they do in normalized wrapper)
+    if len(fin_preds) != len(texts):
+        # fallback: pad/trim
+        fin_preds = (fin_preds + [None] * len(texts))[: len(texts)]
+    if len(tw_preds) != len(texts):
+        tw_preds = (tw_preds + [None] * len(texts))[: len(texts)]
+
+    # Now iterate over filtered items and corresponding preds
+    for (it, tickers), fin_p, tw_p in zip(items_with_tickers, fin_preds, tw_preds):
         fin_scores = _scores_to_fixed_schema(
             fin_p, expected_labels=("negative", "neutral", "positive")
         )
@@ -1068,7 +1085,8 @@ def build_observations_df(
     if late_dropped:
         print(f"Dropped {late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
 
-    pseudo_items = _make_submission_pseudo_rows(submissions)
+    sub = sub_idx.get(submission_id) or sub_idx.get(f"t3_{submission_id}")
+    pseudo_items = _make_submission_pseudo_rows_one(sub)
     for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
         _process_items_chunk(pipe_fin, pipe_tw, agg, pseudo_chunk)
 
@@ -1100,7 +1118,7 @@ if __name__ == "__main__":
             "author": "goodVentures",
             "title": "Thoughts on far OTM GOOG puts for earnings.",
             "selftext": "If they miss earnings, the stock is going to drop hard. Google could tank.",
-            "score": 5,
+            "score": 10,
             "upvote_ratio": 0.90,
             "num_comments": 10,
             "created_ts": "2012-10-01 13:22:10-07:00",

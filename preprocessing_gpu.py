@@ -3,11 +3,21 @@ import re
 import math
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union, Callable
 from pathlib import Path
 
 import pandas as pd
 from transformers import pipeline
+import torch
+from dataclasses import dataclass
+
+from datasets import Dataset
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+)
+from torch.utils.data import DataLoader
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -45,10 +55,20 @@ COMMENT_CUTOFF_HOURS = float(os.getenv("COMMENT_CUTOFF_HOURS", "24"))
 # Output batching (new)
 OUTPUT_DIR_DEFAULT = os.getenv("OBS_OUTPUT_DIR")
 OUTPUT_FORMAT_DEFAULT = os.getenv("OBS_OUTPUT_FORMAT", "parquet").lower()  # parquet|csv
-OUTPUT_ROWS_PER_FILE_DEFAULT = int(os.getenv("OBS_OUTPUT_ROWS_PER_FILE", "50"))
+OUTPUT_ROWS_PER_FILE_DEFAULT = int(os.getenv("OBS_OUTPUT_ROWS_PER_FILE", "100"))
 OUTPUT_FILE_PREFIX_DEFAULT = os.getenv("OBS_OUTPUT_PREFIX", "observations")
 
 SORT_BEFORE_WRITE_DEFAULT = bool(os.getenv("SORT_BEFORE_WRITE", "False"))
+
+MIN_SUBMISSION_COMMENTS = int(os.getenv("MIN_SUBMISSION_COMMENTS", "5"))
+MIN_SUBMISSION_SCORE = int(os.getenv("MIN_SUBMISSION_SCORE", "10"))
+
+if torch.cuda.is_available():
+    DEVICE = 0
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+else:
+    DEVICE = -1
 
 # If a token is ambiguous (common English word / preposition / etc), we require
 # that it appears as ALL CAPS (e.g., "ON" not "on") OR as a cashtag ($ON).
@@ -76,8 +96,11 @@ COMPANY_ALIASES: Dict[str, str] = {
 # ----------------------------
 # Lazy globals
 # ----------------------------
-_pipe_finbert = None
-_pipe_twitter = None
+_finbert_tok = None
+_finbert_model = None
+
+_twitter_tok = None
+_twitter_model = None
 
 _stocks_df = None
 _symbol_regex = None
@@ -204,7 +227,7 @@ def _write_batch_rows(
     df = pd.DataFrame.from_records(rows)
 
     if fmt == "parquet":
-        path = out_dir_p / f"{prefix}_{batch_idx:06d}.parquet"
+        path = out_dir_p / f"{prefix}_{batch_idx:07d}.parquet"
         try:
             df.to_parquet(path, index=False)
             return path
@@ -232,37 +255,34 @@ def _is_local_path(p: str) -> bool:
     except Exception:
         return False
 
-
-def _pipeline_text_cls(model_ref: str, batch_size: int):
+def _load_textcls_model(model_ref: str):
     local_only = _is_local_path(model_ref)
-    return pipeline(
-        "text-classification",
-        model=model_ref,
-        tokenizer=model_ref,
-        device=-1,  # -1 = CUDA GPU, 0 = CPU  (note: your comment was reversed; leaving as-is)
-        batch_size=batch_size,
-        local_files_only=local_only,  # only enforce local if it's actually local
-    )
+    tok = AutoTokenizer.from_pretrained(model_ref, local_files_only=local_only, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_ref, local_files_only=local_only)
+    model.eval()
+
+    if torch.cuda.is_available():
+        model.to("cuda")
+    return tok, model
 
 
-def _get_finbert():
-    global _pipe_finbert
-    if _pipe_finbert is None:
-        _pipe_finbert = _pipeline_text_cls(FINBERT_MODEL_DIR, BATCH_SIZE_FINBERT)
-    return _pipe_finbert
+def _get_finbert_model():
+    global _finbert_tok, _finbert_model
+    if _finbert_model is None or _finbert_tok is None:
+        _finbert_tok, _finbert_model = _load_textcls_model(FINBERT_MODEL_DIR)
+    return _finbert_tok, _finbert_model
 
 
-def _get_twitter_roberta():
-    global _pipe_twitter
-    if _pipe_twitter is None:
-        _pipe_twitter = _pipeline_text_cls(
-            TWITTER_ROBERTA_MODEL_DIR, BATCH_SIZE_TWITTER
-        )
-    return _pipe_twitter
+def _get_twitter_roberta_model():
+    global _twitter_tok, _twitter_model
+    if _twitter_model is None or _twitter_tok is None:
+        _twitter_tok, _twitter_model = _load_textcls_model(TWITTER_ROBERTA_MODEL_DIR)
+    return _twitter_tok, _twitter_model
 
 
 def _run_pipe_all_scores(pipe, texts: List[str]) -> List[List[Dict[str, Any]]]:
-    out = pipe(texts, top_k=None, truncation=True)
+    max_len = getattr(pipe.model.config, "max_position_embeddings", 514) - 2
+    out = pipe(texts, top_k=None, truncation=True, max_length=max_len, padding=True)
     if isinstance(out, list) and out and isinstance(out[0], dict):
         return [out]
     return out
@@ -287,6 +307,57 @@ def _scores_to_fixed_schema(
         if lab in out:
             out[lab] = sc
     return out
+
+def _iter_comments_by_submission(
+    comments: List[Dict[str, Any]],
+    *,
+    assume_grouped: bool = False,
+    sort_if_needed: bool = True,
+):
+    """
+    Yield (submission_id, [comments_for_submission]) pairs.
+
+    - If assume_grouped=True, we treat the input as already grouped by link_id
+      and stream with O(max_comments_in_one_submission) memory.
+    - If assume_grouped=False and sort_if_needed=True, we sort by submission_id
+      first (requires holding list refs, O(N log N)).
+    """
+    if not comments:
+        return
+        yield  # make generator
+
+    def _sub_id(c: Dict[str, Any]) -> str:
+        return _base_id(c.get("link_id"))
+
+    if not assume_grouped:
+        if not sort_if_needed:
+            raise ValueError(
+                "comments are not assumed grouped; set sort_if_needed=True "
+                "or provide comments grouped by link_id."
+            )
+        # Sorting creates a new list of references; you still avoid the huge global agg
+        comments = sorted(comments, key=_sub_id)
+
+    cur_sid = None
+    buf: List[Dict[str, Any]] = []
+
+    for c in comments:
+        sid = _sub_id(c)
+        if not sid:
+            continue
+
+        if cur_sid is None:
+            cur_sid = sid
+
+        if sid != cur_sid:
+            yield cur_sid, buf
+            buf = []
+            cur_sid = sid
+
+        buf.append(c)
+
+    if cur_sid is not None and buf:
+        yield cur_sid, buf
 
 
 # ----------------------------
@@ -369,6 +440,86 @@ def _load_stocks():
         _company_regex = None
 
     return _stocks_df
+
+def _batched(iterable, n):
+    for i in range(0, len(iterable), n):
+        yield iterable[i:i+n]
+
+@dataclass
+class _ModelRunner:
+    tokenizer: Any
+    model: Any
+    batch_size: int
+    max_length: int = 256
+    amp_dtype: Any = torch.float16
+
+    def predict_proba_3way(self, texts: List[str]) -> List[Dict[str, float]]:
+        if not texts:
+            return []
+
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        # label mapping
+        id2label = getattr(self.model.config, "id2label", None) or {}
+        def _norm_label(s: str) -> str:
+            s = str(s).strip().lower()
+            if s in ("label_0", "neg", "negative"):
+                return "negative"
+            if s in ("label_1", "neu", "neutral"):
+                return "neutral"
+            if s in ("label_2", "pos", "positive"):
+                return "positive"
+            return s
+
+        idx_to_key = {}
+        for i in range(int(getattr(self.model.config, "num_labels", 3))):
+            idx_to_key[i] = _norm_label(id2label.get(i, f"label_{i}"))
+        if not (set(idx_to_key.values()) >= {"negative", "neutral", "positive"}):
+            idx_to_key = {0: "negative", 1: "neutral", 2: "positive"}
+
+        bs = int(self.batch_size)
+        while True:
+            try:
+                out: List[Dict[str, float]] = []
+                use_amp = torch.cuda.is_available()
+
+                with torch.inference_mode():
+                    for chunk in _batched(texts, bs):
+                        enc = self.tokenizer(
+                            chunk,
+                            padding=True,
+                            truncation=True,
+                            max_length=int(self.max_length),
+                            return_tensors="pt",
+                        )
+                        enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+
+                        if use_amp:
+                            with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+                                logits = self.model(**enc).logits
+                        else:
+                            logits = self.model(**enc).logits
+
+                        probs = torch.softmax(logits, dim=-1).detach().cpu()
+
+                        for row in probs:
+                            d = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+                            for i, p in enumerate(row.tolist()):
+                                key = idx_to_key.get(i)
+                                if key in d:
+                                    d[key] = float(p)
+                            out.append(d)
+
+                return out
+
+            except torch.OutOfMemoryError:
+                if not torch.cuda.is_available():
+                    raise
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                bs = max(1, bs // 2)
+                if bs == 1:
+                    raise
 
 
 def extract_tickers_from_text(text: str) -> List[str]:
@@ -502,42 +653,43 @@ def _submission_features(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 # ----------------------------
 # Pseudo comment rows for title/selftext
 # ----------------------------
-def _make_submission_pseudo_rows(submissions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _make_submission_pseudo_rows_one(sub: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not sub:
+        return []
+    sid_base = _base_id(sub.get("id"))
+    if not sid_base:
+        return []
+
+    author = sub.get("author") if sub.get("author") is not None else "[deleted]"
+    title = _clean_text(sub.get("title") or "")
+    selftext = _clean_text(sub.get("selftext") or "")
+
     pseudo: List[Dict[str, Any]] = []
-    for s in submissions or []:
-        sid_base = _base_id(s.get("id"))
-        if not sid_base:
-            continue
+    if title:
+        pseudo.append(
+            {
+                "submission_id": sid_base,
+                "ticker_text": title,
+                "author": author,
+                "comment_score": 0.0,
+                "depth": 0,
+                "weight": 1.0 * TITLE_WEIGHT_MULT,
+                "kind": "submission_title",
+            }
+        )
 
-        author = s.get("author") if s.get("author") is not None else "[deleted]"
-        title = _clean_text(s.get("title") or "")
-        selftext = _clean_text(s.get("selftext") or "")
-
-        if title:
-            pseudo.append(
-                {
-                    "submission_id": sid_base,
-                    "ticker_text": title,
-                    "author": author,
-                    "comment_score": 0.0,
-                    "depth": 0,
-                    "weight": 1.0 * TITLE_WEIGHT_MULT,
-                    "kind": "submission_title",
-                }
-            )
-
-        if selftext:
-            pseudo.append(
-                {
-                    "submission_id": sid_base,
-                    "ticker_text": selftext,
-                    "author": author,
-                    "comment_score": 0.0,
-                    "depth": 0,
-                    "weight": 1.0 * SELFTEXT_WEIGHT_MULT,
-                    "kind": "submission_selftext",
-                }
-            )
+    if selftext:
+        pseudo.append(
+            {
+                "submission_id": sid_base,
+                "ticker_text": selftext,
+                "author": author,
+                "comment_score": 0.0,
+                "depth": 0,
+                "weight": 1.0 * SELFTEXT_WEIGHT_MULT,
+                "kind": "submission_selftext",
+            }
+        )
 
     return pseudo
 
@@ -643,47 +795,63 @@ def _agg_update(
     a["tw_pos_wsum"] += tw_scores["positive"] * w
 
 
-def _process_items_chunk(
-    pipe_fin,
-    pipe_tw,
+def _process_items_chunk_datasets(
+    fin_runner: _ModelRunner,
+    tw_runner: _ModelRunner,
     agg: Dict[Tuple[str, str], Dict[str, Any]],
     items: List[Dict[str, Any]],
+    *,
+    dedupe_texts_within_chunk: bool = True,
 ):
-    """
-    items: list of dicts with keys:
-      submission_id, ticker_text, author, comment_score, depth, weight, kind
-    Runs both models on the chunk, extracts tickers, updates agg immediately.
-    """
     if not items:
         return
 
-    texts = [it["ticker_text"] for it in items]
-
-    try:
-        fin_preds = _run_pipe_all_scores(pipe_fin, texts)
-    except Exception as e:
-        print(f"Warning: finbert error on chunk (n={len(texts)}): {e}")
-        fin_preds = [None] * len(texts)
-
-    try:
-        tw_preds = _run_pipe_all_scores(pipe_tw, texts)
-    except Exception as e:
-        print(f"Warning: twitter error on chunk (n={len(texts)}): {e}")
-        tw_preds = [None] * len(texts)
-
-    for it, fin_p, tw_p in zip(items, fin_preds, tw_preds):
+    # 1) Extract tickers (cheap)
+    filtered: List[Dict[str, Any]] = []
+    for it in items:
         tickers = extract_tickers_from_text(it["ticker_text"])
         if not tickers:
             continue
+        it2 = dict(it)
+        it2["_tickers"] = tickers
+        filtered.append(it2)
 
-        fin_scores = _scores_to_fixed_schema(
-            fin_p, expected_labels=("negative", "neutral", "positive")
-        )
-        tw_scores = _scores_to_fixed_schema(
-            tw_p, expected_labels=("negative", "neutral", "positive")
-        )
+    if not filtered:
+        return
 
-        for tkr in tickers:
+    texts = [it["ticker_text"] for it in filtered]
+
+    # 2) Optional dedupe to reduce model calls (often helps a lot with repeated content)
+    if dedupe_texts_within_chunk:
+        # map text -> first index and list of indices
+        text_to_indices: Dict[str, List[int]] = {}
+        unique_texts: List[str] = []
+        for i, t in enumerate(texts):
+            if t not in text_to_indices:
+                text_to_indices[t] = []
+                unique_texts.append(t)
+            text_to_indices[t].append(i)
+
+        fin_unique = fin_runner.predict_proba_3way(unique_texts)
+        tw_unique = tw_runner.predict_proba_3way(unique_texts)
+
+        fin_scores_all = [None] * len(texts)
+        tw_scores_all = [None] * len(texts)
+
+        for ut, fin_s, tw_s in zip(unique_texts, fin_unique, tw_unique):
+            for i in text_to_indices[ut]:
+                fin_scores_all[i] = fin_s
+                tw_scores_all[i] = tw_s
+    else:
+        fin_scores_all = fin_runner.predict_proba_3way(texts)
+        tw_scores_all = tw_runner.predict_proba_3way(texts)
+
+    # 3) Aggregate
+    for it, fin_s, tw_s in zip(filtered, fin_scores_all, tw_scores_all):
+        fin_s = fin_s or {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+        tw_s = tw_s or {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+
+        for tkr in it["_tickers"]:
             _agg_update(
                 agg=agg,
                 submission_id=it["submission_id"],
@@ -693,8 +861,8 @@ def _process_items_chunk(
                 depth=int(it["depth"]),
                 weight=float(it["weight"]),
                 kind=it["kind"],
-                fin_scores=fin_scores,
-                tw_scores=tw_scores,
+                fin_scores=fin_s,
+                tw_scores=tw_s,
             )
 
 
@@ -745,84 +913,59 @@ def _iter_agg_rows(
         yield row
 
 
-def _write_agg_to_batched_files(
-    agg: Dict[Tuple[str, str], Dict[str, Any]],
-    sub_feats_cache: Dict[str, Dict[str, Any]],
+def _append_rows_to_batched_files(
+    *,
+    rows_iterable,
     out_dir: Union[str, Path],
-    rows_per_file: int = OUTPUT_ROWS_PER_FILE_DEFAULT,
-    fmt: str = OUTPUT_FORMAT_DEFAULT,
-    prefix: str = OUTPUT_FILE_PREFIX_DEFAULT,
-    sort_before_write: bool = SORT_BEFORE_WRITE_DEFAULT,
-) -> List[Path]:
+    rows_per_file: int,
+    fmt: str,
+    prefix: str,
+    sort_before_write: bool,
+    batch_rows: List[Dict[str, Any]],
+    batch_idx: int,
+    paths: List[Path],
+) -> int:
     """
-    Convert agg -> rows and write to disk in smaller dataframe batches.
-
-    If sort_before_write=True, we sort keys first for deterministic order, but that
-    requires materializing the sorted key list (still much smaller than a giant DF).
+    Append rows into the existing batch_rows buffer; flush to disk as needed.
+    Returns updated batch_idx.
     """
-    paths: List[Path] = []
-    batch_rows: List[Dict[str, Any]] = []
-    batch_idx = 0
-
     if sort_before_write:
-        items_iter = (
-            ((sid, tkr), agg[(sid, tkr)])
-            for (sid, tkr) in sorted(agg.keys(), key=lambda x: (x[0], x[1]))
-        )
-
-        def row_iter():
-            for (submission_id, ticker), a in items_iter:
-                # inline copy of _iter_agg_rows logic to avoid extra dict iteration
-                n = int(a["n_items"])
-                weight_sum = float(a["weight_sum"])
-                denom = weight_sum if weight_sum != 0.0 else float("nan")
-
-                row = {
-                    "submission_id": submission_id,
-                    "ticker": ticker,
-                    **sub_feats_cache.get(submission_id, {}),
-                    "n_items": n,
-                    "n_authors": int(len(a["authors"])),
-                    "comment_score_sum": float(a["comment_score_sum"]),
-                    "comment_score_mean": float(a["comment_score_sum"]) / n if n else float("nan"),
-                    "comment_score_max": float(a["comment_score_max"]) if n else float("nan"),
-                    "avg_depth": float(a["depth_sum"]) / n if n else float("nan"),
-                    "n_from_comments": int(a["n_from_comments"]),
-                    "n_from_title": int(a["n_from_title"]),
-                    "n_from_selftext": int(a["n_from_selftext"]),
-                    "fin_neg_sum_w": float(a["fin_neg_wsum"]),
-                    "fin_neu_sum_w": float(a["fin_neu_wsum"]),
-                    "fin_pos_sum_w": float(a["fin_pos_wsum"]),
-                    "tw_neg_sum_w": float(a["tw_neg_wsum"]),
-                    "tw_neu_sum_w": float(a["tw_neu_wsum"]),
-                    "tw_pos_sum_w": float(a["tw_pos_wsum"]),
-                    "fin_neg_mean_w": float(a["fin_neg_wsum"]) / denom if weight_sum else float("nan"),
-                    "fin_neu_mean_w": float(a["fin_neu_wsum"]) / denom if weight_sum else float("nan"),
-                    "fin_pos_mean_w": float(a["fin_pos_wsum"]) / denom if weight_sum else float("nan"),
-                    "tw_neg_mean_w": float(a["tw_neg_wsum"]) / denom if weight_sum else float("nan"),
-                    "tw_neu_mean_w": float(a["tw_neu_wsum"]) / denom if weight_sum else float("nan"),
-                    "tw_pos_mean_w": float(a["tw_pos_wsum"]) / denom if weight_sum else float("nan"),
-                }
-                yield row
-
-        rows_iterable = row_iter()
-    else:
-        rows_iterable = _iter_agg_rows(agg, sub_feats_cache)
+        # rows_iterable is expected to be a list or generator; easiest is to materialize
+        # per-submission (small) and sort in-memory.
+        rows_list = list(rows_iterable)
+        rows_list.sort(key=lambda r: (r.get("submission_id", ""), r.get("ticker", "")))
+        rows_iterable = rows_list
 
     for row in rows_iterable:
         batch_rows.append(row)
         if len(batch_rows) >= int(rows_per_file):
-            path = _write_batch_rows(batch_rows, out_dir=out_dir, batch_idx=batch_idx, fmt=fmt, prefix=prefix)
+            path = _write_batch_rows(
+                batch_rows,
+                out_dir=out_dir,
+                batch_idx=batch_idx,
+                fmt=fmt,
+                prefix=prefix,
+            )
             paths.append(path)
             batch_rows.clear()
             batch_idx += 1
 
-    if batch_rows:
-        path = _write_batch_rows(batch_rows, out_dir=out_dir, batch_idx=batch_idx, fmt=fmt, prefix=prefix)
-        paths.append(path)
-        batch_rows.clear()
+    return batch_idx
 
-    return paths
+def _submission_passes_min_activity(sub: Optional[Dict[str, Any]]) -> bool:
+    if not sub:
+        return False  # skip if submission metadata missing
+
+    n_comments = sub.get("num_comments")
+    score = sub.get("score")
+
+    n_comments_i = int(n_comments) if n_comments is not None else 0
+    score_i = int(score) if score is not None else 0
+
+    return (
+        n_comments_i >= MIN_SUBMISSION_COMMENTS
+        and score_i >= MIN_SUBMISSION_SCORE
+    )
 
 
 # ----------------------------
@@ -837,107 +980,139 @@ def build_observations_batched(
     file_format: str = OUTPUT_FORMAT_DEFAULT,  # parquet|csv
     file_prefix: str = OUTPUT_FILE_PREFIX_DEFAULT,
     sort_before_write: bool = SORT_BEFORE_WRITE_DEFAULT,
+    assume_comments_grouped_by_submission: bool = False,
+    sort_comments_by_submission_if_needed: bool = True,
 ) -> List[Path]:
     """
-    Like build_observations_df(), but instead of returning one giant dataframe,
-    it writes smaller dataframe batches to out_dir and returns the written paths.
+    Per-submission aggregation (Option B):
+      - aggregate only within one submission at a time
+      - finalize rows for that submission
+      - append to output batches and flush to disk
 
-    This addresses the "ballooning dataframe" part by never materializing the full DF.
-
-    Note: the aggregation dict (agg) can still grow large if you have an enormous number
-    of (submission_id, ticker) pairs. If that becomes the bottleneck, the next step is
-    spilling/merging aggregation itself.
+    This removes the global agg, bounding memory roughly by:
+      max(comments_in_one_submission) + max(keys_in_one_submission) + output_batch_size
     """
+
     if not isinstance(comments, list):
-        raise ValueError("comments must be a list of dicts (depth computation needs full pass)")
+        raise ValueError("comments must be a list of dicts")
 
     submissions = submissions or []
 
     _load_stocks()
-    pipe_fin = _get_finbert()
-    pipe_tw = _get_twitter_roberta()
+    fin_tok, fin_model = _get_finbert_model()
+    tw_tok, tw_model = _get_twitter_roberta_model()
+
+    fin_runner = _ModelRunner(tokenizer=fin_tok, model=fin_model, batch_size=BATCH_SIZE_FINBERT)
+    tw_runner = _ModelRunner(tokenizer=tw_tok, model=tw_model, batch_size=BATCH_SIZE_TWITTER)
 
     sub_idx = _index_submissions(submissions)
-    depths_by_base = compute_depths(comments)
 
-    agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    paths: List[Path] = []
+    batch_rows: List[Dict[str, Any]] = []
+    batch_idx = 0
 
-    # -------------------------
-    # Stream comments in chunks
-    # -------------------------
-    late_dropped = 0
-    chunk_items: List[Dict[str, Any]] = []
+    total_late_dropped = 0
 
-    for c in comments:
-        submission_id = _base_id(c.get("link_id"))  # link_id is t3_xxx
+    # Iterate submission-by-submission
+    for submission_id, sub_comments in _iter_comments_by_submission(
+        comments,
+        assume_grouped=assume_comments_grouped_by_submission,
+        sort_if_needed=sort_comments_by_submission_if_needed,
+    ):
         sub = sub_idx.get(submission_id) or sub_idx.get(f"t3_{submission_id}")
 
-        if _is_comment_too_late(c, sub):
-            late_dropped += 1
+        # Filter by overall submission activity (from metadata)
+        if not _submission_passes_min_activity(sub):
             continue
 
-        body = _clean_text(c.get("body") or "")
-        if not body:
+        # Compute depths only for this submission's comments
+        depths_by_base = compute_depths(sub_comments)
+
+        # Per-submission aggregation dict
+        agg_sub: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # Chunk + process comment items for this submission
+        chunk_items: List[Dict[str, Any]] = []
+        late_dropped = 0
+
+        for c in sub_comments:
+            if _is_comment_too_late(c, sub):
+                late_dropped += 1
+                continue
+
+            body = _clean_text(c.get("body") or "")
+            if not body:
+                continue
+
+            cid_base = _base_id(c.get("id"))
+            depth = depths_by_base.get(cid_base, 0)
+            w = decay_weight(depth)
+
+            chunk_items.append(
+                {
+                    "submission_id": submission_id,
+                    "ticker_text": body,
+                    "author": c.get("author") if c.get("author") is not None else "[deleted]",
+                    "comment_score": float(c.get("score")) if c.get("score") is not None else 0.0,
+                    "depth": depth,
+                    "weight": w,
+                    "kind": "comment",
+                }
+            )
+
+            if len(chunk_items) >= CHUNK_SIZE_ITEMS:
+                _process_items_chunk_datasets(fin_runner, tw_runner, agg_sub, chunk_items)
+                chunk_items = []
+
+        if chunk_items:
+            _process_items_chunk_datasets(fin_runner, tw_runner, agg_sub, chunk_items)
+
+        total_late_dropped += late_dropped
+
+        # Process this submission's pseudo-items (title/selftext)
+        pseudo_items = _make_submission_pseudo_rows_one(sub)
+        for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
+            _process_items_chunk_datasets(fin_runner, tw_runner, agg_sub, pseudo_chunk)
+
+        if not agg_sub:
+            # Nothing to write for this submission
             continue
 
-        cid_base = _base_id(c.get("id"))
-        depth = depths_by_base.get(cid_base, 0)
-        w = decay_weight(depth)
+        # Build features for this submission only
+        sub_feats_cache = {submission_id: _submission_features(sub)}
 
-        chunk_items.append(
-            {
-                "submission_id": submission_id,
-                "ticker_text": body,
-                "author": c.get("author") if c.get("author") is not None else "[deleted]",
-                "comment_score": float(c.get("score")) if c.get("score") is not None else 0.0,
-                "depth": depth,
-                "weight": w,
-                "kind": "comment",
-            }
+        # Finalize rows and append to output batches
+        rows_iterable = _iter_agg_rows(agg_sub, sub_feats_cache)
+        batch_idx = _append_rows_to_batched_files(
+            rows_iterable=rows_iterable,
+            out_dir=out_dir,
+            rows_per_file=rows_per_file,
+            fmt=file_format,
+            prefix=file_prefix,
+            sort_before_write=sort_before_write,
+            batch_rows=batch_rows,
+            batch_idx=batch_idx,
+            paths=paths,
         )
 
-        if len(chunk_items) >= CHUNK_SIZE_ITEMS:
-            _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
-            chunk_items = []
+        # agg_sub falls out of scope here -> memory released
 
-    if chunk_items:
-        _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
+    # Flush tail batch rows
+    if batch_rows:
+        path = _write_batch_rows(
+            batch_rows,
+            out_dir=out_dir,
+            batch_idx=batch_idx,
+            fmt=file_format,
+            prefix=file_prefix,
+        )
+        paths.append(path)
+        batch_rows.clear()
 
-    if late_dropped:
-        print(f"Dropped {late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
+    if total_late_dropped:
+        print(f"Dropped {total_late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
 
-    # -------------------------
-    # Process pseudo-items (titles/selftext) in chunks too
-    # -------------------------
-    pseudo_items = _make_submission_pseudo_rows(submissions)
-    for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
-        _process_items_chunk(pipe_fin, pipe_tw, agg, pseudo_chunk)
-
-    if not agg:
-        return []
-
-    # -------------------------
-    # Submission features cache
-    # -------------------------
-    sub_feats_cache: Dict[str, Dict[str, Any]] = {}
-    sids = sorted({sid for (sid, _tkr) in agg.keys()})
-    for sid in sids:
-        sub = sub_idx.get(sid) or sub_idx.get(f"t3_{sid}")
-        sub_feats_cache[sid] = _submission_features(sub)
-
-    # -------------------------
-    # Write batches + return paths
-    # -------------------------
-    written_paths = _write_agg_to_batched_files(
-        agg=agg,
-        sub_feats_cache=sub_feats_cache,
-        out_dir=out_dir,
-        rows_per_file=rows_per_file,
-        fmt=file_format,
-        prefix=file_prefix,
-        sort_before_write=sort_before_write,
-    )
-    return written_paths
+    return paths
 
 
 # ----------------------------
@@ -960,8 +1135,11 @@ def build_observations_df(
     submissions = submissions or []
 
     _load_stocks()
-    pipe_fin = _get_finbert()
-    pipe_tw = _get_twitter_roberta()
+    fin_tok, fin_model = _get_finbert_model()
+    tw_tok, tw_model = _get_twitter_roberta_model()
+
+    fin_runner = _ModelRunner(tokenizer=fin_tok, model=fin_model, batch_size=BATCH_SIZE_FINBERT)
+    tw_runner = _ModelRunner(tokenizer=tw_tok, model=tw_model, batch_size=BATCH_SIZE_TWITTER)
 
     sub_idx = _index_submissions(submissions)
     depths_by_base = compute_depths(comments)
@@ -1000,18 +1178,19 @@ def build_observations_df(
         )
 
         if len(chunk_items) >= CHUNK_SIZE_ITEMS:
-            _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
+            _process_items_chunk_datasets(fin_runner, tw_runner, agg, chunk_items)
             chunk_items = []
 
     if chunk_items:
-        _process_items_chunk(pipe_fin, pipe_tw, agg, chunk_items)
+        _process_items_chunk_datasets(fin_runner, tw_runner, agg, chunk_items)
 
     if late_dropped:
         print(f"Dropped {late_dropped} late comments (> {COMMENT_CUTOFF_HOURS}h after submission).")
 
-    pseudo_items = _make_submission_pseudo_rows(submissions)
+    sub = sub_idx.get(submission_id) or sub_idx.get(f"t3_{submission_id}")
+    pseudo_items = _make_submission_pseudo_rows_one(sub)
     for pseudo_chunk in _chunks(pseudo_items, CHUNK_SIZE_ITEMS):
-        _process_items_chunk(pipe_fin, pipe_tw, agg, pseudo_chunk)
+        _process_items_chunk_datasets(fin_runner, tw_runner, agg, pseudo_chunk)
 
     if not agg:
         return pd.DataFrame()
@@ -1041,7 +1220,7 @@ if __name__ == "__main__":
             "author": "goodVentures",
             "title": "Thoughts on far OTM GOOG puts for earnings.",
             "selftext": "If they miss earnings, the stock is going to drop hard. Google could tank.",
-            "score": 5,
+            "score": 10,
             "upvote_ratio": 0.90,
             "num_comments": 10,
             "created_ts": "2012-10-01 13:22:10-07:00",
